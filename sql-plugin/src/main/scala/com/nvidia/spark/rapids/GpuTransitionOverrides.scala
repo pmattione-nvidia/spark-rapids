@@ -809,6 +809,9 @@ class GpuTransitionOverrides extends Rule[SparkPlan] {
           updatedPlan = DeltaProvider().pushDVPredicateDownToScan(updatedPlan)
         }
         updatedPlan = insertHashOptimizeSorts(updatedPlan)
+        if (rapidsConf.isJniRollupExpandFusionEnabled) {
+          updatedPlan = new GpuJniRollupFusionRule(rapidsConf).apply(updatedPlan)
+        }
         updatedPlan = updateScansForInputAndOrder(updatedPlan)
         if (rapidsConf.isFileScanPrunePartitionEnabled) {
           updatedPlan = prunePartitionForFileSourceScan(updatedPlan)
