@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -187,6 +187,23 @@ case class GpuExpandExec(
       }
     }
     (projectListSet.toList, newProjections)
+  }
+
+  /**
+   * True iff [[internalDoExecuteColumnar]] would run the internal multi-tier pre-project before
+   * expanding. [[GpuJniRollupFusionRule]] must not fuse JNI rollup when this is true, because fusion
+   * feeds the aggregate from [[child]] directly and skips that pre-project step.
+   */
+  def wouldRunInternalPreProject: Boolean = {
+    if (!preprojectEnabled) {
+      false
+    } else {
+      val boundPreprojections = GpuBindReferences.bindGpuReferencesTieredNoMetrics(
+        preprojectionList,
+        child.output,
+        conf)
+      boundPreprojections.exprTiers.size > 1
+    }
   }
 }
 

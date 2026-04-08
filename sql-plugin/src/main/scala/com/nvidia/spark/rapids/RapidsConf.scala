@@ -1590,6 +1590,17 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     .booleanConf
     .createWithDefault(true)
 
+  val ENABLE_JNI_ROLLUP_EXPAND_FUSION = conf("spark.rapids.sql.jniRollupExpandFusion.enabled")
+    .doc("When true, fuses GpuExpandExec into GpuHashAggregateExec for Spark ROLLUP partial " +
+      "aggregates and runs libcudf rollup via com.nvidia.spark.rapids.jni.Rollup.aggregate, " +
+      "including spark_grouping_id values aligned with Spark GpuExpand literals, when every " +
+      "partial aggregate is a supported simple hash aggregate (SUM, COUNT, MIN, MAX), " +
+      "non-distinct, and unfiltered. Fusion is skipped when Expand would run its internal " +
+      "multi-tier pre-projection (see GpuExpandExec).")
+    .internal()
+    .booleanConf
+    .createWithDefault(true)
+
   val ENABLE_ORC_FLOAT_TYPES_TO_STRING =
     conf("spark.rapids.sql.format.orc.floatTypesToString.enable")
     .doc("When reading an ORC file, the source data schemas(schemas of ORC file) may differ " +
@@ -3530,6 +3541,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val isExpandPreprojectEnabled: Boolean = get(ENABLE_EXPAND_PREPROJECT)
 
   lazy val isCoalesceAfterExpandEnabled: Boolean = get(ENABLE_COALESCE_AFTER_EXPAND)
+
+  lazy val isJniRollupExpandFusionEnabled: Boolean = get(ENABLE_JNI_ROLLUP_EXPAND_FUSION)
 
   lazy val multiThreadReadNumThreads: Int = {
     // Use the largest value set among all the options.

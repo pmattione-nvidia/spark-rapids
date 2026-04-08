@@ -356,6 +356,15 @@ object AggregateModeInfo {
  *                             as an optimization hint
  * @param conf                 A configuration used to control TieredProject operations in an
  *                             aggregation.
+ * @param fusedRollupRolledUpKeyOrdinals If set, each value is a 0-based index into **data**
+ *                                      grouping keys (same order as `groupingExpressions`) for
+ *                                      columns that participate in ROLLUP; aggregation runs
+ *                                      through [[GpuRollup]] / JNI instead of plain `Table.groupBy`.
+ *                                      Stored as [[Seq]] (not `Array`) so plan equality and
+ *                                      `canonicalized` are stable across runs.
+ * @param fusedRollupGroupingIdAttribute When rollup fusion is used, the `spark_grouping_id` column
+ *                                      is synthesized after JNI aggregate (placeholder until the
+ *                                      kernel fills correct values).
  */
 class AggHelper(
     inputAttributes: Seq[Attribute],
@@ -364,7 +373,9 @@ class AggHelper(
     forceMerge: Boolean,
     conf: SQLConf,
     isSorted: Boolean = false,
-    metrics: Map[String, GpuMetric]) extends Serializable {
+    metrics: Map[String, GpuMetric],
+    private val fusedRollupRolledUpKeyOrdinals: Option[Seq[Int]] = None,
+    private val fusedRollupGroupingIdAttribute: Option[Attribute] = None) extends Serializable {
 
   private var doSortAgg = isSorted
 
@@ -408,11 +419,22 @@ class AggHelper(
   } else {
     preStep ++= groupingExpressions
   }
-  postStep ++= groupingAttributes
-  postStepAttr ++= groupingAttributes
-  postStepDataTypes ++=
-    groupingExpressions.map(_.dataType)
+  if (!forceMerge && fusedRollupRolledUpKeyOrdinals.isDefined) {
+    val gidAttr = fusedRollupGroupingIdAttribute.getOrElse(throw new IllegalStateException(
+      "fusedRollupGroupingIdAttribute is required when fusedRollupRolledUpKeyOrdinals is set"))
+    postStep ++= groupingAttributes
+    postStep += gidAttr
+    postStepAttr ++= groupingAttributes :+ gidAttr
+    postStepDataTypes ++= groupingExpressions.map(_.dataType) :+ gidAttr.dataType
+  } else {
+    postStep ++= groupingAttributes
+    postStepAttr ++= groupingAttributes
+    postStepDataTypes ++= groupingExpressions.map(_.dataType)
+  }
 
+  // Ordinals index the pre-aggregate batch: grouping columns first, then per-aggregate inputs.
+  // Fused JNI rollup has no spark_grouping_id in the child / pre-projection (native adds it on
+  // output); do not reserve an extra input slot like the non-fused Expand + hash path.
   private var ix = groupingAttributes.length
   for (aggExp <- aggregateExpressions) {
     val aggFn = aggExp.aggregateFunction
@@ -560,26 +582,37 @@ class AggHelper(
    * @return a Table that has been cuDF aggregated
    */
   def performGroupByAggregation(preProcessed: ColumnarBatch): ColumnarBatch = {
-    NvtxRegistry.AGG_GROUPBY {
-      withResource(GpuColumnVector.from(preProcessed)) { preProcessedTbl =>
-        val groupOptions = cudf.GroupByOptions.builder()
-          .withIgnoreNullKeys(false)
-          .withKeysSorted(doSortAgg)
-          .build()
+    fusedRollupRolledUpKeyOrdinals match {
+      case Some(rolledUpAmongKeys) =>
+        GpuRollup.aggregate(
+          preProcessed,
+          keySorted = doSortAgg,
+          groupingOrdinals,
+          rolledUpAmongKeys.toArray,
+          cudfAggregates.toSeq,
+          aggOrdinals.toSeq,
+          postStepDataTypes.toArray)
+      case None =>
+        NvtxRegistry.AGG_GROUPBY {
+          withResource(GpuColumnVector.from(preProcessed)) { preProcessedTbl =>
+            val groupOptions = cudf.GroupByOptions.builder()
+              .withIgnoreNullKeys(false)
+              .withKeysSorted(doSortAgg)
+              .build()
 
-        val cudfAggsOnColumn = cudfAggregates.zip(aggOrdinals).map {
-          case (cudfAgg, ord) => cudfAgg.groupByAggregate.onColumn(ord)
+            val cudfAggsOnColumn = cudfAggregates.zip(aggOrdinals).map {
+              case (cudfAgg, ord) => cudfAgg.groupByAggregate.onColumn(ord)
+            }
+
+            val aggTbl = preProcessedTbl
+              .groupBy(groupOptions, groupingOrdinals: _*)
+              .aggregate(cudfAggsOnColumn.toSeq: _*)
+
+            withResource(aggTbl) { _ =>
+              GpuColumnVector.from(aggTbl, postStepDataTypes.toArray)
+            }
+          }
         }
-
-        // perform the aggregate
-        val aggTbl = preProcessedTbl
-          .groupBy(groupOptions, groupingOrdinals: _*)
-          .aggregate(cudfAggsOnColumn.toSeq: _*)
-
-        withResource(aggTbl) { _ =>
-          GpuColumnVector.from(aggTbl, postStepDataTypes.toArray)
-        }
-      }
     }
   }
 
@@ -1938,6 +1971,14 @@ object GpuHashAggregateExecBase {
  *                                      (can omit non fully aggregated data for non-final
  *                                      stage of aggregation)
  * @param skipAggPassReductionRatio skip if the ratio of rows after a pass is bigger than this value
+ * @param fusedRollupRolledUpKeyOrdinals If set (with [[fusedRollupGroupingIdAttribute]]), the first
+ *                                     aggregation pass uses [[GpuRollup]]; values index into data
+ *                                     grouping keys only (excluding spark_grouping_id). Use [[Seq]]
+ *                                     not `Array` for stable plan equality / canonicalization.
+ * @param fusedRollupGroupingIdAttribute Attribute for spark_grouping_id in the post-aggregate batch.
+ * @param fusedRollupMergeGroupingExpressions Grouping expressions for merge / hash repartition;
+ *                                            kept as the pre-fusion sequence when rollup fusion
+ *                                            strips gid from the child-side grouping list.
  */
 case class GpuHashAggregateExec(
     requiredChildDistributionExpressions: Option[Seq[Expression]],
@@ -1951,7 +1992,10 @@ case class GpuHashAggregateExec(
     forceSinglePassAgg: Boolean,
     allowSinglePassAgg: Boolean,
     allowNonFullyAggregatedOutput: Boolean,
-    skipAggPassReductionRatio: Double
+    skipAggPassReductionRatio: Double,
+    fusedRollupRolledUpKeyOrdinals: Option[Seq[Int]] = None,
+    fusedRollupGroupingIdAttribute: Option[Attribute] = None,
+    fusedRollupMergeGroupingExpressions: Option[Seq[NamedExpression]] = None
 ) extends GpuPartitioningPreservingUnaryExecNode with GpuExec with Logging {
 
   // lifted directly from `BaseAggregateExec.inputAttributes`, edited comment.
@@ -2043,7 +2087,10 @@ case class GpuHashAggregateExec(
         localEstimatedPreProcessGrowth, alreadySorted, expectedOrdering,
         postBoundReferences, targetBatchSize, aggMetrics, conf,
         localForcePre, localAllowPre, allowNonFullyAggregatedOutput, skipAggPassReductionRatio,
-        allMetrics
+        allMetrics,
+        fusedRollupRolledUpKeyOrdinals,
+        fusedRollupGroupingIdAttribute,
+        fusedRollupMergeGroupingExpressions
       )
     }
   }
@@ -2164,7 +2211,10 @@ class DynamicGpuPartialAggregateIterator(
     allowSinglePassAgg: Boolean,
     allowNonFullyAggregatedOutput: Boolean,
     skipAggPassReductionRatio: Double,
-    allMetrics: Map[String, GpuMetric]
+    allMetrics: Map[String, GpuMetric],
+    fusedRollupRolledUpKeyOrdinals: Option[Seq[Int]] = None,
+    fusedRollupGroupingIdAttribute: Option[Attribute] = None,
+    fusedRollupMergeGroupingExpressions: Option[Seq[NamedExpression]] = None
 ) extends Iterator[ColumnarBatch] {
   private var aggIter: Option[Iterator[ColumnarBatch]] = None
   private[this] val isReductionOnly = boundGroupExprs.outputExprs.isEmpty
@@ -2256,10 +2306,12 @@ class DynamicGpuPartialAggregateIterator(
       preProcessAggHelper,
       metrics)
 
+    val mergeGroupingExprs =
+      fusedRollupMergeGroupingExpressions.getOrElse(groupingExprs)
     val mergeIter = new GpuMergeAggregateIterator(
       new CloseableBufferedIterator(firstPassIter),
       inputAttrs,
-      groupingExprs,
+      mergeGroupingExprs,
       aggregateExprs,
       aggregateAttrs,
       resultExprs,
@@ -2280,7 +2332,9 @@ class DynamicGpuPartialAggregateIterator(
     if (aggIter.isEmpty) {
       val preProcessAggHelper = new AggHelper(
         inputAttrs, groupingExprs, aggregateExprs,
-        forceMerge = false, isSorted = true, conf = conf, metrics = allMetrics)
+        forceMerge = false, isSorted = true, conf = conf, metrics = allMetrics,
+        fusedRollupRolledUpKeyOrdinals = fusedRollupRolledUpKeyOrdinals,
+        fusedRollupGroupingIdAttribute = fusedRollupGroupingIdAttribute)
       val (inputIter, doSinglePassAgg) = if (allowSinglePassAgg) {
         if (forceSinglePassAgg || alreadySorted) {
           (cbIter, true)
